@@ -8,6 +8,9 @@
 // http://www.apache.org/licenses/LICENSE-2.0
 //
 
+use std::collections::HashMap;
+use pravega_client::event::reader_group::{StreamCutV1, StreamCutVersioned};
+use crate::stream_reader_group::StreamCuts;
 cfg_if! {
     if #[cfg(feature = "python_binding")] {
         use crate::stream_writer_transactional::StreamTxnWriter;
@@ -17,6 +20,7 @@ cfg_if! {
         use pravega_client::client_factory::ClientFactory;
         use pravega_client_shared::*;
         use pravega_client_config::{ClientConfig, ClientConfigBuilder};
+        use pravega_controller_client::paginator::*;
         use pyo3::prelude::*;
         use pyo3::PyResult;
         use pyo3::{exceptions, PyObjectProtocol};
@@ -25,6 +29,7 @@ cfg_if! {
         use tracing::info;
         use pravega_client::event::reader_group::ReaderGroupConfigBuilder;
         use crate::stream_reader_group::StreamReaderGroupConfig;
+        use futures::StreamExt;
     }
 }
 
@@ -227,6 +232,80 @@ impl StreamManager {
             Ok(t) => Ok(t),
             Err(e) => Err(exceptions::PyValueError::new_err(format!("{:?}", e))),
         }
+    }
+
+    ///
+    /// list scope
+    ///
+    #[pyo3(text_signature = "($self)")]
+    pub fn list_scope<'p>(&self, _py: Python<'p>) -> PyResult<Vec<String>> {
+        let controller = self.cf.controller_client();
+        let scope_result = list_scopes(controller);
+        futures::pin_mut!(scope_result);
+        let mut scope_vector = Vec::new();
+        // Used tokio::runtime::Runtime to block on the async code
+        let result = tokio::runtime::Runtime::new().unwrap().block_on(async {
+            while let Some(sc) = scope_result.next().await {
+                scope_vector.push(sc);
+            }
+            Ok::<_, PyErr>(())
+        });
+
+        // to check for errors in the async block
+        if let Err(e) = result {
+            return Err(e);
+        }
+        let mut scope_vector_act: Vec<String> = Vec::new();
+        for scope_val in scope_vector {
+            match scope_val {
+                Ok(scope) => {
+                    scope_vector_act.push(scope.name)
+                },
+                Err(e) => {
+                    return Err(exceptions::PyValueError::new_err(format!("{:?}", e)));
+                },
+            }
+        }
+        Ok(scope_vector_act)
+    }
+
+    ///
+    /// list streams
+    ///
+    #[pyo3(text_signature = "($self, scope_name)")]
+    pub fn list_stream<'p>(&self, scope_name: &str, _py: Python<'p>) -> PyResult<Vec<String>> {
+        let controller = self.cf.controller_client();
+        let stream_result = list_streams(
+            Scope {
+                name: scope_name.to_string(),
+            },
+            controller,
+        );
+        futures::pin_mut!(stream_result);
+        let mut stream_vector = Vec::new();
+        let result = tokio::runtime::Runtime::new().unwrap().block_on(async {
+            while let Some(sc) = stream_result.next().await {
+                stream_vector.push(sc);
+            }
+            Ok::<_, PyErr>(())
+        });
+
+        // to check for errors in the async block
+        if let Err(e) = result {
+            return Err(e);
+        }
+        let mut stream_vector_act: Vec<String> = Vec::new();
+        for stream_val in stream_vector {
+            match stream_val {
+                Ok(scoped_stream) => {
+                    stream_vector_act.push(scoped_stream.stream.name)
+                },
+                Err(e) => {
+                    return Err(exceptions::PyValueError::new_err(format!("{:?}", e)));
+                },
+            }
+        }
+        Ok(stream_vector_act)
     }
 
     ///
@@ -482,7 +561,7 @@ impl StreamManager {
     /// event.reader_group=manager.create_reader_group("rg1", "scope", "stream", true)
     /// ```
     ///
-    #[pyo3(text_signature = "($self, reader_group_name, scope_name, stream_name, read_from_tail)")]
+    #[pyo3(text_signature = "($self, reader_group_name, scope_name, stream_name, read_from_tail, stream_cut)")]
     #[args(read_from_tail = "false")]
     pub fn create_reader_group(
         &self,
@@ -490,24 +569,37 @@ impl StreamManager {
         scope_name: &str,
         stream_name: &str,
         read_from_tail: bool,
+        stream_cut: Option<StreamCuts>,
     ) -> PyResult<StreamReaderGroup> {
         let scope = Scope::from(scope_name.to_string());
+        let stream = Stream::from(stream_name.to_string());
         let scoped_stream = ScopedStream {
             scope: scope.clone(),
-            stream: Stream::from(stream_name.to_string()),
+            stream: stream.clone(),
         };
         let handle = self.cf.runtime_handle();
-        let rg_config = if read_from_tail {
-            // Create a reader group to read from the current TAIL/end of the Stream.
-            ReaderGroupConfigBuilder::default()
-                .read_from_tail_of_stream(scoped_stream)
-                .build()
-        } else {
-            // Create a reader group to read from current HEAD/start of the Stream.
-            ReaderGroupConfigBuilder::default()
-                .read_from_head_of_stream(scoped_stream)
-                .build()
-        };
+        let rg_config = if let Some(ref stream_cut) = stream_cut {
+            let mut positions = HashMap::new();
+            // Iterate over the keys of the offset_map
+            for (segment_val, position) in stream_cut.stream_cuts.segment_offset_map.iter() {
+                let scoped_segment = ScopedSegment::new(scope.clone(), stream.clone(), Segment::from(*segment_val));
+                positions.insert(scoped_segment, *position);
+                }
+                let stream_cut_v1 = StreamCutV1::new(scoped_stream.clone(), positions);
+                // Create a reader group to read from given StreamCut .
+                ReaderGroupConfigBuilder::default().read_from_stream(scoped_stream.clone(), StreamCutVersioned::V1(stream_cut_v1)).build()
+            }else if read_from_tail {
+                // Create a reader group to read from the current TAIL/end of the Stream.
+                ReaderGroupConfigBuilder::default()
+                    .read_from_tail_of_stream(scoped_stream)
+                    .build()
+            } else {
+                // Create a reader group to read from current HEAD/start of the Stream.
+                ReaderGroupConfigBuilder::default()
+                    .read_from_head_of_stream(scoped_stream)
+                    .build()
+            };
+
         let rg = handle.block_on(self.cf.create_reader_group_with_config(
             reader_group_name.to_string(),
             rg_config,
